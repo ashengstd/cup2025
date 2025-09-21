@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+数据集/
+data/
+lightning_logs/
+
+# shit you don't want
+*.DS_Store
