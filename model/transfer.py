@@ -4,6 +4,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pytorch_lightning.callbacks import RichProgressBar
 from rich.logging import RichHandler
 from sklearn.model_selection import train_test_split
@@ -72,6 +73,7 @@ class FeatureTransformerDANN(pl.LightningModule):
         hidden_dim=256,
         lr=1e-3,
         dropout=0.1,
+        beta_kl=0.1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -115,6 +117,8 @@ class FeatureTransformerDANN(pl.LightningModule):
 
         self.criterion = nn.CrossEntropyLoss()
         self.lr = lr
+        self.kl_criterion = nn.KLDivLoss(reduction="batchmean")
+        self.beta_kl = beta_kl
 
     def forward_features(self, x):
         x = self.embedding(x).unsqueeze(1)
@@ -147,8 +151,11 @@ class FeatureTransformerDANN(pl.LightningModule):
         f_concat = torch.cat([f_s, f_t], dim=0)
 
         logits_s = self.classifier(f_s)
+        logits_t = self.classifier(f_t)
         loss_label = self.criterion(logits_s, y_s)
-
+        p_s = F.softmax(logits_s, dim=1)
+        p_s_mean = p_s.mean(dim=0)
+        log_p_t = F.log_softmax(logits_t, dim=1)
         reversed_features = grad_reverse(f_concat, lambda_grl)
         domain_logits = self.domain_classifier(reversed_features)
         domain_labels = torch.cat(
@@ -158,8 +165,8 @@ class FeatureTransformerDANN(pl.LightningModule):
             ]
         )
         loss_domain = self.criterion(domain_logits, domain_labels)
-
-        loss = loss_label + loss_domain
+        loss_kl = self.kl_criterion(log_p_t, p_s_mean.detach())
+        loss = loss_label + loss_domain + self.beta_kl * loss_kl
         self.log_dict(
             {
                 "train_loss": loss,
