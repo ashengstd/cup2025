@@ -32,6 +32,19 @@ logging.basicConfig(
 logger = logging.getLogger("DataPrep")
 
 
+def _extract_source_label(file_path: str) -> str:
+    """
+    Robustly extract the fault type label key (B/IR/OR/N) from a full file path.
+    It searches the path components from right to left and returns the first
+    directory name that matches a known label key.
+    """
+    parts = os.path.normpath(file_path).split(os.sep)
+    for part in reversed(parts):
+        if part in LABEL_MAP:
+            return LABEL_MAP[part]
+    return "Unknown"
+
+
 def process_domain_data(
     root_dir: str, is_source_domain: bool = False
 ) -> tuple[pd.DataFrame, np.ndarray]:
@@ -83,9 +96,8 @@ def process_domain_data(
         # --- Get label ---
         label = "Unknown"
         if is_source_domain:
-            # For source, label is determined by the parent folder name.
-            parent_dir_name = os.path.basename(os.path.dirname(file_path))
-            label = LABEL_MAP.get(parent_dir_name, "Unknown")
+            # For source, extract label from any path component (e.g., B/IR/OR/N).
+            label = _extract_source_label(file_path)
 
         signal = mat_data[data_key].flatten()
         num_samples = len(signal) // SAMPLE_LENGTH
@@ -113,6 +125,16 @@ def process_domain_data(
 
     features_df = pd.concat(all_features_list, ignore_index=True)
     labels_array = np.array(all_labels_list)
+
+    # Safety check: ensure multi-class for source domain
+    if is_source_domain:
+        unique_labels = sorted(list({lab for lab in labels_array if lab != "Unknown"}))
+        if len(unique_labels) < 2:
+            raise ValueError(
+                "Source domain appears to have < 2 valid classes. "
+                "Please verify the dataset root and directory structure. "
+                f"Detected labels (excluding 'Unknown'): {unique_labels}"
+            )
     return features_df, labels_array
 
 
@@ -144,7 +166,7 @@ def coral(Xs: np.ndarray, Xt: np.ndarray) -> np.ndarray:
     A = Cs_inv_sqrt @ linalg.sqrtm(Ct)
 
     # Apply the transformation and return the real part
-    Xs_aligned = (Xs @ A).real
+    Xs_aligned = np.real(Xs @ A)
     return Xs_aligned
 
 
@@ -158,15 +180,19 @@ if __name__ == "__main__":
     features_df_source, labels_source = process_domain_data(
         SOURCE_DATA_DIR, is_source_domain=True
     )
+    # Keep a raw copy to avoid future data leakage during training split
+    X_source_raw = features_df_source.values.astype(np.float64)
     scaler_source = StandardScaler()
-    X_source = scaler_source.fit_transform(features_df_source)
+    X_source = scaler_source.fit_transform(X_source_raw)
     logger.info(f"Source data processed. Shape: {X_source.shape}")
 
     # --- Step 2: Process Unlabeled Target Domain ---
     logger.info("\n[bold]Step 2: Processing Target Domain Data...[/bold]")
     features_df_target, _ = process_domain_data(TARGET_DATA_DIR, is_source_domain=False)
+    # Keep a raw copy to avoid future data leakage during training split
+    X_target_raw = features_df_target.values.astype(np.float64)
     scaler_target = StandardScaler()
-    X_target = scaler_target.fit_transform(features_df_target)
+    X_target = scaler_target.fit_transform(X_target_raw)
     logger.info(f"Target data processed. Shape: {X_target.shape}")
 
     # --- Step 3: Apply CORAL for Domain Alignment ---
@@ -178,10 +204,15 @@ if __name__ == "__main__":
     logger.info(f"\n[bold]Step 4: Saving all arrays to '{OUTPUT_FILE}'...[/bold]")
     np.savez(
         OUTPUT_FILE,
-        X_source=X_source,  # Original source features (for baseline model)
-        y_source=labels_source,  # Source labels
-        X_source_aligned=X_source_aligned,  # Aligned source features (for TL model)
-        X_target=X_target,  # Target features (for prediction)
+        # Scaled versions (legacy)
+        X_source=X_source,
+        X_target=X_target,
+        X_source_aligned=X_source_aligned,
+        # Raw versions (preferred for training to avoid leakage)
+        X_source_raw=X_source_raw,
+        X_target_raw=X_target_raw,
+        # Labels
+        y_source=labels_source,
     )
     logger.info(
         "[bold green]✅ Success![/bold green] Data saved and ready for DNN training."

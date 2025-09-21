@@ -1,4 +1,5 @@
 import logging
+import os
 
 import numpy as np
 import pytorch_lightning as pl
@@ -6,9 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import RichProgressBar
+from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from rich.logging import RichHandler
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from torch.autograd import Function
 from torch.utils.data import DataLoader, Dataset
 
@@ -38,13 +40,14 @@ def grad_reverse(x, lambda_=1.0):
 
 
 class DomainFeatureDataset(Dataset):
-    def __init__(self, X, y=None):
+    def __init__(self, X, y: np.ndarray | None = None):
+        """
+        Dataset that assumes y is already numeric-encoded (0..C-1).
+        Do NOT fit encoders here to avoid train/val mismatch.
+        """
         self.X = torch.tensor(X, dtype=torch.float32)
-        # Use LabelEncoder to convert string labels to integers
         if y is not None:
-            self.le = LabelEncoder().fit(y)
-            self.y = torch.tensor(self.le.transform(y), dtype=torch.long)
-            self.classes = self.le.classes_
+            self.y = torch.tensor(y, dtype=torch.long)
         else:
             self.y = None
 
@@ -54,14 +57,10 @@ class DomainFeatureDataset(Dataset):
     def __getitem__(self, idx):
         if self.y is not None:
             return self.X[idx], self.y[idx]
-        # For target domain, we only return features
         else:
             return self.X[idx], -1  # Return a dummy label
 
 
-# ===================================================================
-# ========== 3. DANN MODEL (No changes needed) ======================
-# ===================================================================
 class FeatureTransformerDANN(pl.LightningModule):
     def __init__(
         self,
@@ -78,8 +77,6 @@ class FeatureTransformerDANN(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # Feature extractor
-        # <<< MODIFIED >>>: Changed nn.Linear to accept multi-dimensional features
         self.embedding = nn.Linear(input_dim, embed_dim)
         self.pos_encoder = nn.Parameter(
             torch.randn(1, 100, embed_dim)
@@ -143,7 +140,8 @@ class FeatureTransformerDANN(pl.LightningModule):
         x_t, _ = target_batch
 
         # Dynamically adjust lambda for GRL
-        p = float(self.current_epoch) / float(self.trainer.max_epochs)
+        max_epochs = self.trainer.max_epochs or 1
+        p = float(self.current_epoch) / float(max_epochs)
         lambda_grl = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1
 
         f_s = self.forward_features(x_s)
@@ -194,30 +192,80 @@ class FeatureTransformerDANN(pl.LightningModule):
 logger.info("Loading pre-processed data from 'transfer_learning_data.npz'...")
 data = np.load("./data/transfer_learning_data.npz")
 
-X_source_aligned = data["X_source_aligned"]
-y_source = data["y_source"]
-X_target = data["X_target"]
+# Prefer raw features to prevent leakage; fall back gracefully
+if "X_source_raw" in data and "X_target_raw" in data:
+    X_source_raw = data["X_source_raw"]
+    X_target_raw = data["X_target_raw"]
+    logger.info("Using raw features from NPZ (recommended).")
+else:
+    # Backward compatibility
+    X_source_raw = data["X_source"]
+    X_target_raw = data["X_target"]
+    logger.warning(
+        "Raw features not found. Falling back to pre-scaled arrays. "
+        "This may introduce slight leakage between train/val. Consider regenerating the NPZ."
+    )
 
-num_classes = len(np.unique(y_source))
-input_dim = X_source_aligned.shape[1]
+y_source_str = data["y_source"]
+le = LabelEncoder().fit(y_source_str)
+y_source = le.transform(y_source_str)
+num_classes = len(le.classes_)
 
-logger.info(f"Input feature dimension: {input_dim}")
-logger.info(f"Number of classes: {num_classes}")
-logger.info(f"Source samples: {len(X_source_aligned)}, Target samples: {len(X_target)}")
+if num_classes < 2:
+    raise RuntimeError(
+        "y_source has <2 classes. Check preprocessing label extraction and dataset paths."
+    )
 
-X_train_s, X_val_s, y_train_s, y_val_s = train_test_split(
-    X_source_aligned, y_source, test_size=0.2, random_state=42, stratify=y_source
+# Train/val split on source domain with stratification
+X_train_s_raw, X_val_s_raw, y_train_s, y_val_s = train_test_split(
+    X_source_raw, y_source, test_size=0.2, random_state=42, stratify=y_source
 )
 
-train_source_dataset = DomainFeatureDataset(X_train_s, y_train_s)
-val_dataset = DomainFeatureDataset(X_val_s, y_val_s)
+# Scale using train-only statistics
+scaler_s = StandardScaler().fit(X_train_s_raw)
+X_train_s = scaler_s.transform(X_train_s_raw)
+X_val_s = scaler_s.transform(X_val_s_raw)
+
+# Scale target with its own scaler (unsupervised, allowed)
+scaler_t = StandardScaler().fit(X_target_raw)
+X_target = scaler_t.transform(X_target_raw)
+
+
+def _coral_fit(Xs: np.ndarray, Xt: np.ndarray) -> np.ndarray:
+    d = Xs.shape[1]
+    Cs = np.cov(Xs, rowvar=False) + np.eye(d)
+    Ct = np.cov(Xt, rowvar=False) + np.eye(d)
+    from scipy import linalg as _lg
+
+    A = _lg.inv(_lg.sqrtm(Cs)) @ _lg.sqrtm(Ct)
+    return np.real(A)
+
+
+# Compute CORAL transform on train split only, then apply to both train and val
+A_coral = _coral_fit(X_train_s, X_target)
+X_train_s_aligned = np.real(X_train_s @ A_coral)
+X_val_s_aligned = np.real(X_val_s @ A_coral)
+
+input_dim = X_train_s_aligned.shape[1]
+logger.info(f"Input feature dimension: {input_dim}")
+logger.info(f"Number of classes: {num_classes} -> {list(le.classes_)}")
+logger.info(
+    f"Source samples: total={len(X_source_raw)}, train={len(X_train_s_aligned)}, val={len(X_val_s_aligned)}; "
+    f"Target samples: {len(X_target)}"
+)
+
+train_source_dataset = DomainFeatureDataset(X_train_s_aligned, y_train_s)
+val_dataset = DomainFeatureDataset(X_val_s_aligned, y_val_s)
 train_target_dataset = DomainFeatureDataset(X_target)  # No labels for target
 
 train_source_loader = DataLoader(train_source_dataset, batch_size=64, shuffle=True)
 train_target_loader = DataLoader(train_target_dataset, batch_size=64, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
-train_loaders = {"source": train_source_loader, "target": train_target_loader}
+train_loaders = CombinedLoader(
+    {"source": train_source_loader, "target": train_target_loader},
+    mode="max_size_cycle",
+)
 
 
 logger.info("\nInitializing DANN model...")
@@ -225,8 +273,10 @@ model = FeatureTransformerDANN(
     input_dim=input_dim, num_classes=num_classes, lr=1e-4, dropout=0.4
 )
 
+pl.seed_everything(42, workers=True)
+max_epochs = int(os.getenv("MAX_EPOCHS", "30"))
 trainer = pl.Trainer(
-    max_epochs=30,
+    max_epochs=max_epochs,
     accelerator="auto",
     devices=1,
     callbacks=[RichProgressBar()],
