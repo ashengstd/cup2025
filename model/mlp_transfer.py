@@ -24,7 +24,7 @@ logging.basicConfig(
     datefmt="[%X]",
     handlers=[RichHandler(rich_tracebacks=True)],
 )
-logger = logging.getLogger("transfer_learning")
+logger = logging.getLogger("mlp_transfer")
 
 
 class GradientReversalFunction(Function):
@@ -45,10 +45,6 @@ def grad_reverse(x, lambda_=1.0):
 
 class DomainFeatureDataset(Dataset):
     def __init__(self, X, y: np.ndarray | None = None):
-        """
-        Dataset that assumes y is already numeric-encoded (0..C-1).
-        Do NOT fit encoders here to avoid train/val mismatch.
-        """
         self.X = torch.tensor(X, dtype=torch.float32)
         if y is not None:
             self.y = torch.tensor(y, dtype=torch.long)
@@ -65,62 +61,52 @@ class DomainFeatureDataset(Dataset):
             return self.X[idx], -1  # Return a dummy label
 
 
-class FeatureTransformerDANN(pl.LightningModule):
+class FeatureMLPDANN(pl.LightningModule):
     def __init__(
         self,
         input_dim,
         num_classes,
-        embed_dim=16,
-        num_heads=2,
-        num_layers=1,
         hidden_dim=64,
         lr=1e-4,
-        dropout=0.1,
+        dropout=0.2,
         beta_kl=0.02,
         class_weights: torch.Tensor | None = None,
-        warmup_epochs: int = 5,  # <-- 优化点1: 增加warmup参数
+        warmup_epochs: int = 5,
+        lambda_scale: float = 1.0,  # <-- 新增：对抗强度调节器
     ):
         super().__init__()
-        # 保存所有超参数，包括warmup_epochs
-        self.save_hyperparameters()
-        # 同时存为实例属性，便于访问与静态检查
+        self.save_hyperparameters()  # lambda_scale 会被自动保存
         self.lr = lr
         self.beta_kl = beta_kl
         self.warmup_epochs = warmup_epochs
 
-        # 将每个标量特征视为一个token
-        self.seq_len = input_dim
-        self.embedding = nn.Linear(1, embed_dim)
-        self.pos_encoder = nn.Parameter(torch.randn(1, self.seq_len, embed_dim))
-        self.norm_input = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            batch_first=True,
-            activation="relu",
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # 分类器和领域分类器的定义不变
-        self.classifier = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+        # --- 新的MLP特征提取器 ---
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * 2),
+            nn.BatchNorm1d(hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        # --- 分类器和领域分类器 ---
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes),
         )
 
         self.domain_classifier = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim // 2, 2),
         )
 
-        # 其他初始化部分不变
         if class_weights is not None:
             self.register_buffer("cls_weights", class_weights.float())
         else:
@@ -128,22 +114,11 @@ class FeatureTransformerDANN(pl.LightningModule):
 
         self.criterion = nn.CrossEntropyLoss()
         self.kl_criterion = nn.KLDivLoss(reduction="batchmean")
-        # 默认启用 DANN；当且仅当设置 NO_DANN=1 时关闭
         self.use_dann = os.getenv("NO_DANN", "0") != "1"
         self.use_class_weights = os.getenv("USE_CLASS_WEIGHTS", "0") == "1"
 
     def forward_features(self, x):
-        # x: [B, F]
-        x = x.unsqueeze(-1)  # [B, F, 1]
-        x = self.embedding(x)  # [B, F, D]
-        x = x + self.pos_encoder[:, : x.size(1), :]
-        x = self.norm_input(x)
-        x = self.dropout(x)
-        x = self.transformer(x)
-
-        # <-- 优化点2: 使用均值池化替代额外的Attention层
-        x = x.mean(dim=1)
-        return x
+        return self.feature_extractor(x)
 
     def forward(self, x):
         features = self.forward_features(x)
@@ -151,10 +126,7 @@ class FeatureTransformerDANN(pl.LightningModule):
         return logits
 
     def training_step(self, batch, batch_idx):
-        # In SOURCE_ONLY mode, batch is a tuple (x, y).
-        # In normal DANN mode, batch is a dict {'source': ..., 'target': ...}.
         if isinstance(batch, dict):
-            # --- Normal DANN training path ---
             source_batch = batch["source"]
             target_batch = batch["target"]
             x_s, y_s = source_batch
@@ -166,7 +138,12 @@ class FeatureTransformerDANN(pl.LightningModule):
                 effective_max_epochs = max(1, max_epochs - self.warmup_epochs)
                 current_progress_epoch = self.current_epoch - self.warmup_epochs
                 p = float(current_progress_epoch) / float(effective_max_epochs)
-                lambda_grl = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1) * 0.5
+                # 【核心修改】使用 lambda_scale 调节对抗强度
+                lambda_grl = (
+                    (2.0 / (1.0 + np.exp(-10.0 * p)) - 1)
+                    * 0.5
+                    * self.hparams.lambda_scale
+                )
 
             f_s = self.forward_features(x_s)
             f_t = self.forward_features(x_t)
@@ -198,9 +175,8 @@ class FeatureTransformerDANN(pl.LightningModule):
                 loss_domain = torch.tensor(0.0, device=self.device)
                 loss = loss_label
         else:
-            # --- SOURCE_ONLY sanity check path ---
             x_s, y_s = batch
-            logits_s = self(x_s)  # self(x) calls forward_features and classifier
+            logits_s = self(x_s)
             weight = self.cls_weights if self.use_class_weights else None
             loss_label = F.cross_entropy(logits_s, y_s, weight=weight)
             loss = loss_label
@@ -226,14 +202,10 @@ class FeatureTransformerDANN(pl.LightningModule):
         self.log_dict({"val_loss": loss, "val_acc": acc}, prog_bar=True)
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        """Custom predict step to correctly unpack the batch."""
-        # The batch from the DataLoader is a tuple (features, labels).
-        # We only need the features for prediction.
         x, _ = batch
         return self(x)
 
     def configure_optimizers(self):
-        # 使用self.hparams.lr替代self.lr，这是Lightning的推荐做法
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=0.01)
         return optimizer
 
@@ -241,7 +213,6 @@ class FeatureTransformerDANN(pl.LightningModule):
 logger.info("Loading pre-processed data from 'data/transfer_learning_data.npz' …")
 data = np.load("data/transfer_learning_data.npz", allow_pickle=True)
 
-# New schema produced by preprocess/transfer_data.py
 X_train_s_raw = data["X_train_s_raw"]
 X_val_s_raw = data["X_val_s_raw"]
 X_target_raw = data["X_target_raw"]
@@ -249,7 +220,6 @@ X_target_raw = data["X_target_raw"]
 y_train_s_str = data["y_train_s"]
 y_val_s_str = data["y_val_s"]
 
-# 过滤掉无法识别标签的样本，避免把 Unknown 当成类别
 if (y_train_s_str == "Unknown").any():
     mask = y_train_s_str != "Unknown"
     X_train_s_raw = X_train_s_raw[mask]
@@ -261,11 +231,9 @@ if (y_val_s_str == "Unknown").any():
     y_val_s_str = y_val_s_str[mask]
     logger.warning(f"Filtered Unknown from val: remaining={len(y_val_s_str)}")
 
-# Encode labels using training set only, then transform val
 le = LabelEncoder().fit(y_train_s_str)
 y_train_s = np.asarray(le.transform(y_train_s_str), dtype=np.int64)
 
-# 过滤验证集中不在训练类集合中的样本，避免 transform 报错
 known_classes = set(le.classes_.tolist())
 mask_val_known = np.array([lbl in known_classes for lbl in y_val_s_str])
 if not mask_val_known.all():
@@ -281,7 +249,6 @@ num_classes = len(le.classes_)
 if num_classes < 2:
     raise RuntimeError("Training set has <2 classes. Check dataset directories.")
 
-# Standardize using train-only statistics; target uses its own scaler
 scaler_s = StandardScaler().fit(X_train_s_raw)
 X_train_s = scaler_s.transform(X_train_s_raw)
 X_val_s = scaler_s.transform(X_val_s_raw)
@@ -289,7 +256,6 @@ X_val_s = scaler_s.transform(X_val_s_raw)
 scaler_t = StandardScaler().fit(X_target_raw)
 X_target = scaler_t.transform(X_target_raw)
 
-# Guard against potential NaN/Inf values
 X_train_s = np.nan_to_num(X_train_s, posinf=1e6, neginf=-1e6)
 X_val_s = np.nan_to_num(X_val_s, posinf=1e6, neginf=-1e6)
 X_target = np.nan_to_num(X_target, posinf=1e6, neginf=-1e6)
@@ -305,10 +271,8 @@ def _coral_fit(Xs: np.ndarray, Xt: np.ndarray) -> np.ndarray:
     return np.real(A)
 
 
-# --- CORAL Alignment (optional) ---
 if os.getenv("NO_CORAL", "0") != "1":
     logger.info("Applying CORAL alignment...")
-    # Compute CORAL transform on train split only, then apply to both train and val
     A_coral = _coral_fit(X_train_s, X_target)
     X_train_s_aligned = np.real(X_train_s @ A_coral)
     X_val_s_aligned = np.real(X_val_s @ A_coral)
@@ -326,11 +290,7 @@ logger.info(
 
 train_source_dataset = DomainFeatureDataset(X_train_s_aligned, y_train_s)
 val_dataset = DomainFeatureDataset(X_val_s_aligned, y_val_s)
-train_target_dataset = DomainFeatureDataset(X_target)  # No labels for target
-
-train_source_loader = DataLoader(train_source_dataset, batch_size=64, shuffle=True)
-train_target_loader = DataLoader(train_target_dataset, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+train_target_dataset = DomainFeatureDataset(X_target)
 
 train_source_loader = DataLoader(train_source_dataset, batch_size=64, shuffle=True)
 train_target_loader = DataLoader(train_target_dataset, batch_size=64, shuffle=True)
@@ -338,7 +298,6 @@ val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
 logger.info("\nInitializing DANN model...")
 
-# Compute inverse-frequency class weights
 counts = np.bincount(y_train_s, minlength=num_classes)
 freq = counts / counts.sum()
 inv_freq = 1.0 / np.maximum(freq, 1e-6)
@@ -347,12 +306,13 @@ logger.info(
     f"Class counts: {counts.tolist()} -> weights: {np.round(cls_weights, 3).tolist()}"
 )
 
-model = FeatureTransformerDANN(
+model = FeatureMLPDANN(
     input_dim=input_dim,
     num_classes=num_classes,
     lr=1e-4,
-    dropout=0.2,  # <-- Reduced dropout as a first tuning step
+    dropout=0.2,
     class_weights=torch.tensor(cls_weights),
+    lambda_scale=0.2,
 )
 
 pl.seed_everything(42, workers=True)
@@ -366,11 +326,12 @@ trainer = pl.Trainer(
     gradient_clip_val=1.0,
 )
 
-# --- Run Training ---
 if os.getenv("SOURCE_ONLY", "0") == "1":
     logger.warning("<<<<< SOURCE-ONLY SANITY CHECK MODE >>>>>")
     logger.warning("Training on source data only. CombinedLoader is disabled.")
-    trainer.fit(model, train_dataloaders=train_source_loader, val_dataloaders=val_loader)
+    trainer.fit(
+        model, train_dataloaders=train_source_loader, val_dataloaders=val_loader
+    )
 else:
     logger.info("Starting model training with CombinedLoader (Source + Target)...")
     train_loaders = CombinedLoader(
@@ -383,18 +344,14 @@ logger.info("Training complete!")
 
 logger.info("\n" + "=" * 20 + " FINAL VALIDATION " + "=" * 20)
 
-# Run prediction on the validation set using the best model checkpoint
 logger.info("Running prediction on validation set...")
 prediction_batches = trainer.predict(model, dataloaders=val_loader)
 
-# Concatenate batches and get final class predictions
 y_pred_logits = torch.cat(prediction_batches)
 y_pred = torch.argmax(y_pred_logits, dim=1).cpu().numpy()
 
-# True labels are in y_val_s
 y_true = y_val_s
 
-# Calculate and log metrics
 acc = accuracy_score(y_true, y_pred)
 report = classification_report(y_true, y_pred, target_names=le.classes_, digits=4)
 cm = confusion_matrix(y_true, y_pred)
@@ -402,4 +359,3 @@ cm = confusion_matrix(y_true, y_pred)
 logger.info(f"Final Validation Accuracy: {acc:.4f}")
 logger.info(f"Final Classification Report:\n{report}")
 logger.info(f"Final Confusion Matrix:\n{cm}")
-
