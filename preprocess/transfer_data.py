@@ -7,7 +7,6 @@ import scipy.io as sio
 from rich.logging import RichHandler
 from rich.progress import track
 from scipy import linalg
-from sklearn.preprocessing import StandardScaler
 
 from features import (
     frequency_domain_features,
@@ -15,7 +14,9 @@ from features import (
     wavelet_packet_features,
 )
 
-SOURCE_DATA_DIR = "./数据集/源域数据集/48kHz_DE_data/"
+# 默认设置：48kHz 作为源域训练，12kHz 作为源域验证；目标域用于 DANN（无标签）
+SOURCE_TRAIN_DIR = "./数据集/源域数据集/48kHz_DE_data/"
+SOURCE_VAL_DIR = "./数据集/源域数据集/12kHz_FE_data/"
 TARGET_DATA_DIR = "./数据集/目标域数据集/"
 OUTPUT_FILE = "./data/transfer_learning_data.npz"
 SAMPLE_LENGTH = 1024
@@ -27,7 +28,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
+    handlers=[RichHandler(rich_tracebacks=True, markup=True)],
 )
 logger = logging.getLogger("DataPrep")
 
@@ -139,35 +140,17 @@ def process_domain_data(
 
 
 # ===================================================================
-# ========== 4. CORAL ALGORITHM ==========
+# ========== 4.（可选）CORAL 工具 ==========
 # ===================================================================
 
 
 def coral(Xs: np.ndarray, Xt: np.ndarray) -> np.ndarray:
-    """
-    Implements the CORAL algorithm for Unsupervised Domain Adaptation.
-    It aligns the covariance of the source data with the covariance of the target data.
-
-    Args:
-        Xs: Source domain feature matrix (n_source, n_features).
-        Xt: Target domain feature matrix (n_target, n_features).
-
-    Returns:
-        The transformed source domain features (Xs_aligned).
-    """
     d = Xs.shape[1]
-    # Source covariance
     Cs = np.cov(Xs, rowvar=False) + np.eye(d)
-    # Target covariance
     Ct = np.cov(Xt, rowvar=False) + np.eye(d)
-
-    # Calculate the transformation matrix
     Cs_inv_sqrt = linalg.inv(linalg.sqrtm(Cs))
     A = Cs_inv_sqrt @ linalg.sqrtm(Ct)
-
-    # Apply the transformation and return the real part
-    Xs_aligned = np.real(Xs @ A)
-    return Xs_aligned
+    return np.real(Xs @ A)
 
 
 # ===================================================================
@@ -175,45 +158,56 @@ def coral(Xs: np.ndarray, Xt: np.ndarray) -> np.ndarray:
 # ===================================================================
 
 if __name__ == "__main__":
-    # --- Step 1: Process Labeled Source Domain ---
-    logger.info("[bold]Step 1: Processing Source Domain Data...[/bold]")
-    features_df_source, labels_source = process_domain_data(
-        SOURCE_DATA_DIR, is_source_domain=True
-    )
-    # Keep a raw copy to avoid future data leakage during training split
-    X_source_raw = features_df_source.values.astype(np.float64)
-    scaler_source = StandardScaler()
-    X_source = scaler_source.fit_transform(X_source_raw)
-    logger.info(f"Source data processed. Shape: {X_source.shape}")
-
-    # --- Step 2: Process Unlabeled Target Domain ---
-    logger.info("\n[bold]Step 2: Processing Target Domain Data...[/bold]")
-    features_df_target, _ = process_domain_data(TARGET_DATA_DIR, is_source_domain=False)
-    # Keep a raw copy to avoid future data leakage during training split
-    X_target_raw = features_df_target.values.astype(np.float64)
-    scaler_target = StandardScaler()
-    X_target = scaler_target.fit_transform(X_target_raw)
-    logger.info(f"Target data processed. Shape: {X_target.shape}")
-
-    # --- Step 3: Apply CORAL for Domain Alignment ---
-    logger.info("\n[bold]Step 3: Applying CORAL for Domain Alignment...[/bold]")
-    X_source_aligned = coral(X_source, X_target)
-    logger.info(f"CORAL alignment complete. Shape: {X_source_aligned.shape}")
-
-    # --- Step 4: Save Processed Data for DNN Training ---
-    logger.info(f"\n[bold]Step 4: Saving all arrays to '{OUTPUT_FILE}'...[/bold]")
-    np.savez(
-        OUTPUT_FILE,
-        # Scaled versions (legacy)
-        X_source=X_source,
-        X_target=X_target,
-        X_source_aligned=X_source_aligned,
-        # Raw versions (preferred for training to avoid leakage)
-        X_source_raw=X_source_raw,
-        X_target_raw=X_target_raw,
-        # Labels
-        y_source=labels_source,
+    # --- Step 1: 源域训练（48kHz）---
+    logger.info("[bold]Step 1: Processing Source-Train (48kHz) ...[/bold]")
+    feats_train_df, y_train = process_domain_data(
+        SOURCE_TRAIN_DIR, is_source_domain=True
     )
     logger.info(
-        "[bold green]✅ Success![/bold green] Data saved and ready for DNN training."
+        f"Source-Train extracted: X={feats_train_df.shape}, y={y_train.shape}, classes={sorted(set(y_train.tolist()))}"
     )
+
+    # --- Step 2: 源域验证（12kHz）---
+    logger.info("\n[bold]Step 2: Processing Source-Val (12kHz) ...[/bold]")
+    feats_val_df, y_val = process_domain_data(SOURCE_VAL_DIR, is_source_domain=True)
+    logger.info(
+        f"Source-Val extracted: X={feats_val_df.shape}, y={y_val.shape}, classes={sorted(set(y_val.tolist()))}"
+    )
+
+    # --- Step 3: 目标域（无标签，用于 DANN）---
+    logger.info("\n[bold]Step 3: Processing Target (Unlabeled) ...[/bold]")
+    feats_tgt_df, _ = process_domain_data(TARGET_DATA_DIR, is_source_domain=False)
+    logger.info(f"Target extracted: X={feats_tgt_df.shape}")
+
+    # --- 对齐特征列，确保一致顺序 ---
+    common_cols = sorted(
+        set(feats_train_df.columns)
+        & set(feats_val_df.columns)
+        & set(feats_tgt_df.columns)
+    )
+    if not common_cols:
+        raise RuntimeError("No common feature columns among train/val/target.")
+    feats_train_df = feats_train_df[common_cols]
+    feats_val_df = feats_val_df[common_cols]
+    feats_tgt_df = feats_tgt_df[common_cols]
+
+    # --- 只保存 RAW（原始）特征，避免任何泄漏；缩放/对齐在训练脚本执行 ---
+    X_train_s_raw = feats_train_df.values.astype(np.float64)
+    X_val_s_raw = feats_val_df.values.astype(np.float64)
+    X_target_raw = feats_tgt_df.values.astype(np.float64)
+
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    logger.info(f"\n[bold]Step 4: Saving arrays to '{OUTPUT_FILE}' ...[/bold]")
+    np.savez(
+        OUTPUT_FILE,
+        X_train_s_raw=X_train_s_raw,
+        y_train_s=y_train,
+        X_val_s_raw=X_val_s_raw,
+        y_val_s=y_val,
+        X_target_raw=X_target_raw,
+        feature_names=np.array(common_cols),
+        source_train_dir=np.array([SOURCE_TRAIN_DIR]),
+        source_val_dir=np.array([SOURCE_VAL_DIR]),
+        target_dir=np.array([TARGET_DATA_DIR]),
+    )
+    logger.info("[bold green]✅ Done. Data ready for transfer learning (DANN).")
